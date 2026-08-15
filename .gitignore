@@ -4,4 +4,5 @@ __pycache__/
 .env
 *.txt
 !requirements.txt
-*.log
+data_fetch.log
+data_fetch.log.*
