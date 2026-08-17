@@ -30,7 +30,7 @@ def get_last_close() -> float:
 
 
 def generate_candles(date: str, start_close: float) -> pd.DataFrame:
-    times = pd.date_range(f"{date} 09:15", f"{date} 15:45", freq="1min", tz=IST_OFFSET)
+    times = pd.date_range(f"{date} 09:15", f"{date} 15:30", freq="1min", tz=IST_OFFSET)
     n = len(times)
 
     np.random.seed(hash(date) % (2**31))

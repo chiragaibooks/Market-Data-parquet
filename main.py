@@ -108,7 +108,7 @@ def is_market_open() -> bool:
     if now.weekday() >= 5:
         return False
     open_  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    close_ = now.replace(hour=15, minute=45, second=0, microsecond=0)
+    close_ = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return open_ <= now <= close_
 
 
@@ -204,12 +204,12 @@ def insert_data(symbol: str, df: pd.DataFrame):
     df["volume"]      = df["volume"].fillna(0)
     df["updated_at"]  = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
-    # filter to Mon-Fri market hours 09:15-15:45
+    # filter to Mon-Fri market hours 09:15-15:30
     dt = pd.to_datetime(df["datetime"])
     df = df[
         (dt.dt.weekday < 5) &
         (dt.dt.strftime("%H:%M") >= "09:15") &
-        (dt.dt.strftime("%H:%M") <= "15:45")
+        (dt.dt.strftime("%H:%M") <= "15:30")
     ]
 
     if df.empty:
