@@ -3384,3 +3384,8 @@
 2026-08-17 10:51:25,297 - INFO - [NIFTY50] yfinance fetched 1875 rows
 2026-08-17 10:51:25,891 - INFO - [NIFTY50] Inserted 1875 candles
 2026-08-17 10:51:27,901 - INFO - Cycle complete. README updated.
+2026-08-17 10:52:31,365 - INFO - Starting fetch cycle
+2026-08-17 10:52:32,527 - INFO - [NIFTY50] ETF volume merged from NIFTYBEES.NS
+2026-08-17 10:52:32,528 - INFO - [NIFTY50] yfinance fetched 1875 rows
+2026-08-17 10:52:33,320 - INFO - [NIFTY50] Inserted 1875 candles
+2026-08-17 10:52:35,336 - INFO - Cycle complete. README updated.
