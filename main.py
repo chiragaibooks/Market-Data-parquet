@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 import sqlite3
@@ -35,10 +36,11 @@ from ta.volume import (
 # ==========================================================
 # CONFIG
 # ==========================================================
-README_FILE  = "README.md"
-SYMBOLS_FILE = "symbols.json"
-DB_FILE      = "market_data.db"
-IST          = pytz.timezone("Asia/Kolkata")
+README_FILE   = "README.md"
+SYMBOLS_FILE  = "symbols.json"
+DB_DIR        = "data"
+DB_SIZE_LIMIT = 100 * 1024 * 1024  # 100 MB
+IST           = pytz.timezone("Asia/Kolkata")
 
 INDEX_MAP = {
     "NIFTY50": ("NIFTY", "NSE"),
@@ -164,10 +166,25 @@ _INSERT_SQL = """
 )
 
 
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
+def get_active_db() -> str:
+    """Return active DB path in data/. Creates a new dated DB if current >= 100MB."""
+    os.makedirs(DB_DIR, exist_ok=True)
+    dbs = sorted(f for f in os.listdir(DB_DIR) if f.endswith(".db"))
+    if dbs:
+        current = os.path.join(DB_DIR, dbs[-1])
+        if os.path.getsize(current) < DB_SIZE_LIMIT:
+            return current
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    new_db = os.path.join(DB_DIR, f"market_data_{today}.db")
+    with sqlite3.connect(new_db) as conn:
         conn.execute(_CREATE_SQL)
         conn.commit()
+    logger.info("Created new DB: %s", new_db)
+    return new_db
+
+
+def init_db():
+    get_active_db()
 
 
 def _to_ist_str(dt_series: pd.Series) -> pd.Series:
@@ -203,17 +220,18 @@ def insert_data(symbol: str, df: pd.DataFrame):
         if col not in df.columns:
             df[col] = None
 
-    with sqlite3.connect(DB_FILE) as conn:
+    db_path = get_active_db()
+    with sqlite3.connect(db_path) as conn:
         conn.execute(_CREATE_SQL)
         conn.executemany(_INSERT_SQL, df[COLS].values.tolist())
         conn.commit()
-    logger.info("[%s] Inserted %d candles", symbol, len(df))
+    logger.info("[%s] Inserted %d candles into %s", symbol, len(df), db_path)
 
 
 def latest_rows(symbol: str, n: int = 10) -> pd.DataFrame:
     try:
         today = datetime.now(IST).strftime("%Y-%m-%d")
-        with sqlite3.connect(DB_FILE) as conn:
+        with sqlite3.connect(get_active_db()) as conn:
             df = pd.read_sql_query(
                 "SELECT * FROM indexes WHERE stock_name=? AND datetime LIKE ? ORDER BY datetime DESC LIMIT ?",
                 conn, params=(symbol, f"{today}%", n)
@@ -458,7 +476,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         import sqlite3 as _sq
         _sym = df["stock_name"].iloc[0] if "stock_name" in df.columns else "NIFTY50"
         _today = str(pd.to_datetime(df["datetime"].iloc[0]).date())
-        with _sq.connect(DB_FILE) as _conn:
+        with _sq.connect(get_active_db()) as _conn:
             _prev = _conn.execute(
                 "SELECT MAX(high), MIN(low), close FROM indexes WHERE stock_name=? AND date(datetime) = (SELECT MAX(date(datetime)) FROM indexes WHERE stock_name=? AND date(datetime) < ?) ORDER BY datetime DESC LIMIT 1",
                 (_sym, _sym, _today)
