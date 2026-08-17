@@ -3279,3 +3279,8 @@
 2026-08-17 10:30:58,717 - INFO - [NIFTY50] yfinance fetched 1875 rows
 2026-08-17 10:30:59,531 - INFO - [NIFTY50] Inserted 1875 candles
 2026-08-17 10:31:01,540 - INFO - Cycle complete. README updated.
+2026-08-17 10:31:29,775 - INFO - Starting fetch cycle
+2026-08-17 10:31:30,034 - INFO - [NIFTY50] yfinance empty, falling back to TradingView
+2026-08-17 10:31:30,559 - INFO - [NIFTY50] TV fetched 1875 rows
+2026-08-17 10:31:31,453 - INFO - [NIFTY50] Inserted 192 candles
+2026-08-17 10:31:33,740 - INFO - Cycle complete. README updated.
