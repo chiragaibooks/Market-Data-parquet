@@ -211,14 +211,14 @@ def insert_data(symbol: str, df: pd.DataFrame):
     logger.info("[%s] Inserted %d candles", symbol, len(df))
 
 
-def latest_rows(symbol: str) -> pd.DataFrame:
-    """Return all candles (09:15-15:30) for the latest available trading day."""
+def latest_rows(symbol: str, n: int = 10) -> pd.DataFrame:
+    """Return the last n candles for the latest available trading day."""
     try:
         today = datetime.now(IST).strftime("%Y-%m-%d")
         with sqlite3.connect(DB_FILE) as conn:
             df = pd.read_sql_query(
-                "SELECT * FROM indexes WHERE stock_name=? AND datetime LIKE ? ORDER BY datetime ASC",
-                conn, params=(symbol, f"{today}%")
+                "SELECT * FROM indexes WHERE stock_name=? AND datetime LIKE ? ORDER BY datetime DESC LIMIT ?",
+                conn, params=(symbol, f"{today}%", n)
             )
             if df.empty:
                 row = conn.execute(
@@ -229,12 +229,12 @@ def latest_rows(symbol: str) -> pd.DataFrame:
                 if latest_date:
                     logger.info("[%s] No data for today (%s), showing latest: %s", symbol, today, latest_date)
                     df = pd.read_sql_query(
-                        "SELECT * FROM indexes WHERE stock_name=? AND datetime LIKE ? ORDER BY datetime ASC",
-                        conn, params=(symbol, f"{latest_date}%")
+                        "SELECT * FROM indexes WHERE stock_name=? AND datetime LIKE ? ORDER BY datetime DESC LIMIT ?",
+                        conn, params=(symbol, f"{latest_date}%", n)
                     )
         if df.empty:
             return pd.DataFrame()
-        return df.reset_index(drop=True)
+        return df.iloc[::-1].reset_index(drop=True)
     except Exception:
         logger.exception("Failed to read latest rows for %s", symbol)
         return pd.DataFrame()
@@ -534,9 +534,8 @@ def update_readme():
             signal = generate_signal(row)
             f.write(f"\n---\n\n### {sym} &nbsp; {ICONS[signal]}\n\n")
 
-            # ── All Candles 09:15-15:30 ────────────────────────
-            date_label = rows['datetime'].iloc[0][:10]
-            f.write(f"**Candles for {date_label} (09:15 - 15:30 IST)**\n\n")
+            # ── Last 10 Candles ────────────────────────────────
+            f.write("**🕯️ Last 10 Candles**\n\n")
             f.write("| Time (IST) | Open | High | Low | Close | Volume | Signal |\n")
             f.write("|-----------|------|------|-----|-------|--------|--------|\n")
             for _, r in rows.iterrows():
