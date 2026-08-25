@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import time
-import sqlite3
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -38,7 +37,7 @@ from ta.volume import (
 # ==========================================================
 README_FILE  = "README.md"
 SYMBOLS_FILE = "symbols.json"
-DB_FILE      = "market_data.db"
+DATA_DIR     = "data"
 IST          = pytz.timezone("Asia/Kolkata")
 
 INDEX_MAP = {
@@ -112,63 +111,12 @@ def is_market_open() -> bool:
 
 
 # ==========================================================
-# DATABASE
+# PARQUET HELPERS
 # ==========================================================
-_CREATE_SQL = """
-    CREATE TABLE IF NOT EXISTS indexes (
-        datetime         TEXT,
-        stock_name       TEXT,
-        open             REAL, high            REAL, low             REAL,
-        close            REAL, volume          REAL,
-        sma_5            REAL, sma_10          REAL, sma_20          REAL,
-        sma_50           REAL, sma_100         REAL, sma_200         REAL,
-        ema_5            REAL, ema_10          REAL, ema_20          REAL,
-        ema_50           REAL, ema_100         REAL, ema_200         REAL,
-        wma_10           REAL, wma_20          REAL,
-        macd             REAL, macd_signal     REAL, macd_diff       REAL,
-        adx              REAL, adx_pos         REAL, adx_neg         REAL,
-        aroon_up         REAL, aroon_down      REAL, aroon_indicator REAL,
-        cci              REAL, dpo             REAL, mass_index      REAL,
-        ichimoku_a       REAL, ichimoku_b      REAL, ichimoku_base   REAL, ichimoku_conv REAL,
-        psar             REAL, stc             REAL, trix            REAL,
-        vortex_pos       REAL, vortex_neg      REAL,
-        kc_upper         REAL, kc_middle       REAL, kc_lower        REAL,
-        dc_upper         REAL, dc_middle       REAL, dc_lower        REAL,
-        atr              REAL,
-        bb_upper         REAL, bb_middle       REAL, bb_lower        REAL,
-        bb_pband         REAL, bb_wband        REAL,
-        ulcer_index      REAL,
-        rsi_7            REAL, rsi_14          REAL, rsi_21          REAL,
-        stoch_k          REAL, stoch_d         REAL,
-        roc              REAL, williams_r      REAL,
-        awesome_oscillator REAL, kama          REAL,
-        ppo              REAL, tsi             REAL, ultimate_oscillator REAL,
-        obv              REAL, cmf             REAL, acc_dist        REAL,
-        mfi              REAL, force_index     REAL, eom             REAL,
-        vpt              REAL, nvi             REAL, vwap            REAL,
-        price_change_pct REAL,
-        pivot            REAL, pivot_r1        REAL, pivot_r2        REAL, pivot_r3        REAL,
-        pivot_s1         REAL, pivot_s2        REAL, pivot_s3        REAL,
-        signal           TEXT,
-        updated_at       TEXT,
-        PRIMARY KEY (datetime, stock_name)
-    )
-"""
-
-_INSERT_SQL = """
-    INSERT OR REPLACE INTO indexes
-    ({cols})
-    VALUES ({placeholders})
-""".format(
-    cols=", ".join(COLS),
-    placeholders=", ".join(["?"] * len(COLS))
-)
-
-
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(_CREATE_SQL)
-        conn.commit()
+def _parquet_path(symbol: str, date_str: str) -> str:
+    """Return path to the parquet file for a given symbol and date (YYYY-MM-DD)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, f"{symbol}_{date_str}.parquet")
 
 
 def _to_ist_str(dt_series: pd.Series) -> pd.Series:
@@ -181,12 +129,13 @@ def _to_ist_str(dt_series: pd.Series) -> pd.Series:
 
 
 def insert_data(symbol: str, df: pd.DataFrame):
+    """Compute indicators and upsert candles into the daily parquet file."""
     df = compute_indicators(df)
     df = df.copy()
-    df["stock_name"]  = symbol
-    df["datetime"]    = _to_ist_str(df["datetime"])
-    df["volume"]      = df["volume"].fillna(0)
-    df["updated_at"]  = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    df["stock_name"] = symbol
+    df["datetime"]   = _to_ist_str(df["datetime"])
+    df["volume"]     = df["volume"].fillna(0)
+    df["updated_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
     # filter to Mon-Fri market hours 09:15-15:30
     dt = pd.to_datetime(df["datetime"])
@@ -204,37 +153,88 @@ def insert_data(symbol: str, df: pd.DataFrame):
         if col not in df.columns:
             df[col] = None
 
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(_CREATE_SQL)
-        conn.executemany(_INSERT_SQL, df[COLS].values.tolist())
-        conn.commit()
-    logger.info("[%s] Inserted %d candles", symbol, len(df))
+    # compute pivot points from previous day's parquet
+    _add_pivots(df, symbol)
+
+    df["signal"] = df.apply(generate_signal, axis=1)
+
+    # group by date and write/merge each day's parquet
+    df["_date"] = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d")
+    for date_str, day_df in df.groupby("_date"):
+        day_df = day_df.drop(columns=["_date"])
+        path = _parquet_path(symbol, date_str)
+        if os.path.exists(path):
+            existing = pd.read_parquet(path)
+            merged = pd.concat([existing, day_df]).drop_duplicates(
+                subset=["datetime", "stock_name"], keep="last"
+            ).sort_values("datetime").reset_index(drop=True)
+        else:
+            merged = day_df[COLS].reset_index(drop=True)
+        merged[COLS].to_parquet(path, index=False, engine="pyarrow")
+        logger.info("[%s] Saved %d candles -> %s", symbol, len(merged), path)
+
+
+def _add_pivots(df: pd.DataFrame, symbol: str):
+    """Add pivot point columns derived from the previous trading day's parquet."""
+    try:
+        today = str(pd.to_datetime(df["datetime"].iloc[0]).date())
+        prev_df = _read_prev_day_parquet(symbol, today)
+        if prev_df is not None and not prev_df.empty:
+            ph = float(prev_df["high"].max())
+            pl = float(prev_df["low"].min())
+            pc = float(prev_df["close"].iloc[-1])
+            p  = (ph + pl + pc) / 3
+            df["pivot"]    = round(p, 2)
+            df["pivot_r1"] = round(2 * p - pl, 2)
+            df["pivot_r2"] = round(p + (ph - pl), 2)
+            df["pivot_r3"] = round(ph + 2 * (p - pl), 2)
+            df["pivot_s1"] = round(2 * p - ph, 2)
+            df["pivot_s2"] = round(p - (ph - pl), 2)
+            df["pivot_s3"] = round(pl - 2 * (ph - p), 2)
+    except Exception:
+        logger.exception("Pivot calculation failed")
+
+
+def _read_prev_day_parquet(symbol: str, today: str) -> pd.DataFrame | None:
+    """Return the parquet DataFrame for the most recent trading day before today."""
+    if not os.path.isdir(DATA_DIR):
+        return None
+    files = sorted(
+        f for f in os.listdir(DATA_DIR)
+        if f.startswith(f"{symbol}_") and f.endswith(".parquet")
+    )
+    # find the latest date strictly before today
+    for fname in reversed(files):
+        date_str = fname[len(symbol) + 1:-len(".parquet")]
+        if date_str < today:
+            try:
+                return pd.read_parquet(os.path.join(DATA_DIR, fname))
+            except Exception:
+                continue
+    return None
 
 
 def latest_rows(symbol: str, n: int = 10) -> pd.DataFrame:
-    """Return the last n candles for the latest available trading day."""
+    """Return the last n candles for the latest available trading day from parquet."""
     try:
         today = datetime.now(IST).strftime("%Y-%m-%d")
-        with sqlite3.connect(DB_FILE) as conn:
-            df = pd.read_sql_query(
-                "SELECT * FROM indexes WHERE stock_name=? AND datetime LIKE ? ORDER BY datetime DESC LIMIT ?",
-                conn, params=(symbol, f"{today}%", n)
-            )
-            if df.empty:
-                row = conn.execute(
-                    "SELECT MAX(date(datetime)) FROM indexes WHERE stock_name=?",
-                    (symbol,)
-                ).fetchone()
-                latest_date = row[0] if row and row[0] else None
-                if latest_date:
-                    logger.info("[%s] No data for today (%s), showing latest: %s", symbol, today, latest_date)
-                    df = pd.read_sql_query(
-                        "SELECT * FROM indexes WHERE stock_name=? AND datetime LIKE ? ORDER BY datetime DESC LIMIT ?",
-                        conn, params=(symbol, f"{latest_date}%", n)
-                    )
+        path  = _parquet_path(symbol, today)
+
+        if not os.path.exists(path):
+            # fall back to the most recent available parquet
+            prev = _read_prev_day_parquet(symbol, "9999-99-99")
+            if prev is None or prev.empty:
+                return pd.DataFrame()
+            logger.info("[%s] No parquet for today (%s), using latest available", symbol, today)
+            df = prev
+        else:
+            df = pd.read_parquet(path)
+
         if df.empty:
             return pd.DataFrame()
-        return df.iloc[::-1].reset_index(drop=True)
+
+        df = df.sort_values("datetime").tail(n).reset_index(drop=True)
+        return df
     except Exception:
         logger.exception("Failed to read latest rows for %s", symbol)
         return pd.DataFrame()
@@ -425,7 +425,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["stoch_d"] = _safe(lambda: _stoch.stoch_signal())
 
     # ROC, Williams %R
-    df["roc"]       = _safe(lambda: ROCIndicator(c, 12).roc())
+    df["roc"]        = _safe(lambda: ROCIndicator(c, 12).roc())
     df["williams_r"] = _safe(lambda: WilliamsRIndicator(h, l, c, 14).williams_r())
 
     # Awesome Oscillator, KAMA
@@ -438,14 +438,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ultimate_oscillator"] = _safe(lambda: UltimateOscillator(h, l, c, 7, 14, 28).ultimate_oscillator())
 
     # Volume indicators
-    df["obv"]        = _safe(lambda: OnBalanceVolumeIndicator(c, v).on_balance_volume())
-    df["cmf"]        = _safe(lambda: ChaikinMoneyFlowIndicator(h, l, c, v, 20).chaikin_money_flow())
-    df["acc_dist"]   = _safe(lambda: AccDistIndexIndicator(h, l, c, v).acc_dist_index())
-    df["mfi"]        = _safe(lambda: MFIIndicator(h, l, c, v, 14).money_flow_index())
+    df["obv"]         = _safe(lambda: OnBalanceVolumeIndicator(c, v).on_balance_volume())
+    df["cmf"]         = _safe(lambda: ChaikinMoneyFlowIndicator(h, l, c, v, 20).chaikin_money_flow())
+    df["acc_dist"]    = _safe(lambda: AccDistIndexIndicator(h, l, c, v).acc_dist_index())
+    df["mfi"]         = _safe(lambda: MFIIndicator(h, l, c, v, 14).money_flow_index())
     df["force_index"] = _safe(lambda: ForceIndexIndicator(c, v, 13).force_index())
-    df["eom"]        = _safe(lambda: EaseOfMovementIndicator(h, l, v, 14).ease_of_movement())
-    df["vpt"]        = _safe(lambda: VolumePriceTrendIndicator(c, v).volume_price_trend())
-    df["nvi"]        = _safe(lambda: NegativeVolumeIndexIndicator(c, v).negative_volume_index())
+    df["eom"]         = _safe(lambda: EaseOfMovementIndicator(h, l, v, 14).ease_of_movement())
+    df["vpt"]         = _safe(lambda: VolumePriceTrendIndicator(c, v).volume_price_trend())
+    df["nvi"]         = _safe(lambda: NegativeVolumeIndexIndicator(c, v).negative_volume_index())
 
     # VWAP
     df["vwap"] = _safe(lambda: VolumeWeightedAveragePrice(h, l, c, v).volume_weighted_average_price())
@@ -453,29 +453,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Price change %
     df["price_change_pct"] = _safe(lambda: c.pct_change() * 100)
 
-
-    # Pivot Points (Classic, based on previous trading day OHLC from DB)
-    try:
-        import sqlite3 as _sq
-        _sym = df["stock_name"].iloc[0] if "stock_name" in df.columns else "NIFTY50"
-        _today = str(pd.to_datetime(df["datetime"].iloc[0]).date())
-        with _sq.connect(DB_FILE) as _conn:
-            _prev = _conn.execute(
-                "SELECT MAX(high), MIN(low), close FROM indexes WHERE stock_name=? AND date(datetime) = (SELECT MAX(date(datetime)) FROM indexes WHERE stock_name=? AND date(datetime) < ?) ORDER BY datetime DESC LIMIT 1",
-                (_sym, _sym, _today)
-            ).fetchone()
-        if _prev and all(v is not None for v in _prev):
-            _ph, _pl, _pc = float(_prev[0]), float(_prev[1]), float(_prev[2])
-            _p = (_ph + _pl + _pc) / 3
-            df["pivot"]    = _p
-            df["pivot_r1"] = 2 * _p - _pl
-            df["pivot_r2"] = _p + (_ph - _pl)
-            df["pivot_r3"] = _ph + 2 * (_p - _pl)
-            df["pivot_s1"] = 2 * _p - _ph
-            df["pivot_s2"] = _p - (_ph - _pl)
-            df["pivot_s3"] = _pl - 2 * (_ph - _p)
-    except Exception:
-        logger.exception("Pivot calculation failed")
     return df
 
 
@@ -609,10 +586,8 @@ def update_readme():
 # MAIN
 # ==========================================================
 def main():
-
     logger.info("Starting fetch cycle")
     tv = TvDatafeed()
-    init_db()
 
     for symbol in INDEXES:
         try:

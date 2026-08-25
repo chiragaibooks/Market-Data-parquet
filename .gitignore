@@ -6,4 +6,5 @@ __pycache__/
 !requirements.txt
 data_fetch.log
 data_fetch.log.*
+*.db
 data/*.db
