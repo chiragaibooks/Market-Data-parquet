@@ -19,7 +19,7 @@ SYMBOL     = "NIFTY50"
 YF_TICKER  = "^NSEI"
 ETF_TICKER = "NIFTYBEES.NS"
 IST        = pytz.timezone("Asia/Kolkata")
-START_DATE = "2026-08-01"
+START_DATE = "2026-08-24"
 
 
 def _parquet_path(date: str) -> str:
