@@ -1,148 +1,94 @@
 """
-Generate daily parquet files for NIFTY50 (2026-08-17 onwards).
-For each date: uses real parquet data if available, else simulated candles.
-Re-running updates the parquet with the latest rows.
+Generate daily parquet files for NIFTY50 from yfinance.
+- Without args: backfills ALL missing trading days from 2026-08-01 to today
+- --today: only generates/updates today's parquet
 """
-import numpy as np
-import pandas as pd
-import sys
-import os
 import argparse
+import os
+import sys
+
+import pandas as pd
+import pytz
+import yfinance as yf
 
 sys.path.insert(0, os.path.dirname(__file__))
-from main import compute_indicators, COLS, DATA_DIR
+from main import compute_indicators, COLS
 
-IST_OFFSET = "Asia/Kolkata"
-SYMBOL = "NIFTY50"
-DATES = [
-    d.strftime("%Y-%m-%d")
-    for d in pd.date_range("2026-08-17", "2026-12-31", freq="B")
-]
+DATA_DIR   = "data"
+SYMBOL     = "NIFTY50"
+YF_TICKER  = "^NSEI"
+ETF_TICKER = "NIFTYBEES.NS"
+IST        = pytz.timezone("Asia/Kolkata")
+START_DATE = "2026-08-01"
 
 
 def _parquet_path(date: str) -> str:
     return os.path.join(DATA_DIR, f"{SYMBOL}_{date}.parquet")
 
 
-def get_last_close() -> float:
-    """Return the most recent closing price from existing parquet files."""
-    if not os.path.isdir(DATA_DIR):
-        return 24300.0
-    files = sorted(
-        f for f in os.listdir(DATA_DIR)
-        if f.startswith(f"{SYMBOL}_") and f.endswith(".parquet")
-    )
-    for fname in reversed(files):
-        try:
-            df = pd.read_parquet(os.path.join(DATA_DIR, fname))
-            if not df.empty and "close" in df.columns:
-                return float(df["close"].iloc[-1])
-        except Exception:
-            continue
-    return 24300.0
+def fetch_yf_data(start: str, end: str) -> pd.DataFrame:
+    """Fetch 1-min OHLCV from yfinance with ETF volume merge."""
+    df = yf.download(YF_TICKER, start=start, end=end, interval="1m",
+                     progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0].lower() for c in df.columns]
+    else:
+        df.columns = [c.lower() for c in df.columns]
+    df = df.reset_index()
+    df.rename(columns={df.columns[0]: "datetime"}, inplace=True)
+
+    # merge ETF volume
+    etf = yf.download(ETF_TICKER, start=start, end=end, interval="1m",
+                      progress=False, auto_adjust=True)
+    if etf is not None and not etf.empty:
+        if isinstance(etf.columns, pd.MultiIndex):
+            etf.columns = [c[0].lower() for c in etf.columns]
+        else:
+            etf.columns = [c.lower() for c in etf.columns]
+        etf = etf.reset_index()
+        etf.rename(columns={etf.columns[0]: "datetime"}, inplace=True)
+        etf["datetime"] = pd.to_datetime(etf["datetime"]).dt.floor("min")
+        df["datetime"]  = pd.to_datetime(df["datetime"]).dt.floor("min")
+        merged = df[["datetime"]].merge(
+            etf[["datetime", "volume"]].rename(columns={"volume": "etf_vol"}),
+            on="datetime", how="left"
+        )
+        df["volume"] = merged["etf_vol"].ffill().fillna(0).astype(int).values
+
+    df = df[["datetime", "open", "high", "low", "close", "volume"]].dropna(subset=["close"])
+    return df
 
 
-def _read_prev_day_parquet(today: str) -> pd.DataFrame | None:
-    """Return the parquet DataFrame for the most recent trading day before today."""
-    if not os.path.isdir(DATA_DIR):
-        return None
+def _prev_day_pivots(date: str) -> dict:
+    """Get pivot levels from the previous available parquet file."""
     files = sorted(
         f for f in os.listdir(DATA_DIR)
         if f.startswith(f"{SYMBOL}_") and f.endswith(".parquet")
     )
     for fname in reversed(files):
         date_str = fname[len(SYMBOL) + 1:-len(".parquet")]
-        if date_str < today:
+        if date_str < date:
             try:
-                return pd.read_parquet(os.path.join(DATA_DIR, fname))
+                prev = pd.read_parquet(os.path.join(DATA_DIR, fname))
+                ph = float(prev["high"].max())
+                pl = float(prev["low"].min())
+                pc = float(prev["close"].iloc[-1])
+                p  = (ph + pl + pc) / 3
+                return {
+                    "pivot":    round(p, 2),
+                    "pivot_r1": round(2*p - pl, 2),
+                    "pivot_r2": round(p + (ph - pl), 2),
+                    "pivot_r3": round(ph + 2*(p - pl), 2),
+                    "pivot_s1": round(2*p - ph, 2),
+                    "pivot_s2": round(p - (ph - pl), 2),
+                    "pivot_s3": round(pl - 2*(ph - p), 2),
+                }
             except Exception:
                 continue
-    return None
-
-
-def generate_candles(date: str, start_close: float) -> pd.DataFrame:
-    times = pd.date_range(f"{date} 09:15", f"{date} 15:30", freq="1min", tz=IST_OFFSET)
-    n = len(times)
-
-    np.random.seed(hash(date) % (2**31))
-    returns = np.random.normal(0.00005, 0.0008, n)
-    closes = start_close * np.cumprod(1 + returns)
-
-    noise = np.abs(np.random.normal(0, 0.0004, n))
-    highs  = closes * (1 + noise)
-    lows   = closes * (1 - noise)
-    opens  = np.roll(closes, 1)
-    opens[0] = start_close
-
-    # keep high >= max(open, close), low <= min(open, close)
-    highs = np.maximum(highs, np.maximum(opens, closes))
-    lows  = np.minimum(lows,  np.minimum(opens, closes))
-
-    volumes = np.random.randint(5000, 80000, n).astype(float)
-    volumes[:5]   *= 1.8
-    volumes[-10:] *= 1.5
-
-    df = pd.DataFrame({
-        "datetime": times.strftime("%Y-%m-%d %H:%M"),
-        "open":     np.round(opens,   2),
-        "high":     np.round(highs,   2),
-        "low":      np.round(lows,    2),
-        "close":    np.round(closes,  2),
-        "volume":   np.round(volumes, 0),
-    })
-    return df
-
-
-def fetch_parquet_candles(date: str) -> pd.DataFrame:
-    """Return existing candles from the parquet file for this date, if present."""
-    path = _parquet_path(date)
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    try:
-        df = pd.read_parquet(path, columns=["datetime", "open", "high", "low", "close", "volume"])
-        return df
-    except Exception as e:
-        print(f"Parquet read skipped for {date}: {e}")
-        return pd.DataFrame()
-
-
-def build_day(date: str, start_close: float) -> pd.DataFrame:
-    existing_df = fetch_parquet_candles(date)
-    if not existing_df.empty:
-        print(f"  Using {len(existing_df)} existing rows from parquet")
-        df = existing_df.copy()
-    else:
-        df = generate_candles(date, start_close)
-
-    df["stock_name"] = SYMBOL
-    df = compute_indicators(df)
-
-    # pivot points from previous day's parquet
-    try:
-        prev = _read_prev_day_parquet(date)
-        if prev is not None and not prev.empty:
-            ph = float(prev["high"].max())
-            pl = float(prev["low"].min())
-            pc = float(prev["close"].iloc[-1])
-            p  = (ph + pl + pc) / 3
-            df["pivot"]    = round(p, 2)
-            df["pivot_r1"] = round(2 * p - pl, 2)
-            df["pivot_r2"] = round(p + (ph - pl), 2)
-            df["pivot_r3"] = round(ph + 2 * (p - pl), 2)
-            df["pivot_s1"] = round(2 * p - ph, 2)
-            df["pivot_s2"] = round(p - (ph - pl), 2)
-            df["pivot_s3"] = round(pl - 2 * (ph - p), 2)
-    except Exception as e:
-        print(f"Pivot calc skipped: {e}")
-
-    df["signal"]     = df.apply(_signal, axis=1)
-    df["updated_at"] = pd.Timestamp.now(tz=IST_OFFSET).strftime("%Y-%m-%d %H:%M:%S IST")
-
-    for col in COLS:
-        if col not in df.columns:
-            df[col] = None
-
-    return df[COLS]
+    return {}
 
 
 def _signal(row) -> str:
@@ -150,39 +96,111 @@ def _signal(row) -> str:
         req = ["close", "ema_20", "rsi_14", "macd", "macd_signal", "adx"]
         if any(pd.isna(row.get(c)) for c in req):
             return "HOLD"
-        if (row["close"] > row["ema_20"] and row["rsi_14"] > 55
-                and row["macd"] > row["macd_signal"] and row["adx"] > 20):
+        if row["close"] > row["ema_20"] and row["rsi_14"] > 55 and row["macd"] > row["macd_signal"] and row["adx"] > 20:
             return "BUY"
-        if (row["close"] < row["ema_20"] and row["rsi_14"] < 45
-                and row["macd"] < row["macd_signal"] and row["adx"] > 20):
+        if row["close"] < row["ema_20"] and row["rsi_14"] < 45 and row["macd"] < row["macd_signal"] and row["adx"] > 20:
             return "SELL"
     except Exception:
         pass
     return "HOLD"
 
 
+def build_parquet(date: str, day_df: pd.DataFrame):
+    """Compute indicators and save parquet for a single day."""
+    day_df = day_df.copy()
+    day_df["stock_name"] = SYMBOL
+
+    # convert datetime to IST string
+    dt = pd.to_datetime(day_df["datetime"])
+    if dt.dt.tz is None:
+        dt = dt.dt.tz_localize("UTC")
+    dt = dt.dt.tz_convert(IST)
+    day_df["datetime"] = dt.dt.strftime("%Y-%m-%d %H:%M")
+
+    # filter 09:15-15:30 IST weekdays
+    dt_parsed = pd.to_datetime(day_df["datetime"])
+    day_df = day_df[
+        (dt_parsed.dt.weekday < 5) &
+        (dt_parsed.dt.strftime("%H:%M") >= "09:15") &
+        (dt_parsed.dt.strftime("%H:%M") <= "15:30")
+    ]
+    if day_df.empty:
+        print(f"  No market-hours data for {date}, skipping.")
+        return
+
+    day_df = compute_indicators(day_df)
+
+    # pivot points
+    pivots = _prev_day_pivots(date)
+    for col, val in pivots.items():
+        day_df[col] = val
+
+    day_df["signal"]     = day_df.apply(_signal, axis=1)
+    day_df["updated_at"] = pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+    for col in COLS:
+        if col not in day_df.columns:
+            day_df[col] = None
+
+    out = _parquet_path(date)
+    day_df[COLS].to_parquet(out, index=False, engine="pyarrow")
+    print(f"  Saved {len(day_df)} rows -> {out}  |  close: {day_df['close'].iloc[-1]:.2f}")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--today", action="store_true", help="Only process today's date")
+    parser.add_argument("--today", action="store_true", help="Only process today")
     args = parser.parse_args()
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    last_close = get_last_close()
-    print(f"Starting close: {last_close:.2f}")
 
-    today_str = pd.Timestamp.now(tz=IST_OFFSET).strftime("%Y-%m-%d")
-    dates_to_run = [today_str] if args.today else DATES
+    today = pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d")
+
+    if args.today:
+        dates_to_run = [today]
+    else:
+        # all business days from START_DATE to today
+        all_dates = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(START_DATE, today)]
+        # only missing ones
+        existing = {
+            f[len(SYMBOL)+1:-len(".parquet")]
+            for f in os.listdir(DATA_DIR)
+            if f.startswith(f"{SYMBOL}_") and f.endswith(".parquet")
+        }
+        dates_to_run = [d for d in all_dates if d not in existing]
+        if not dates_to_run:
+            print("All parquet files already exist. Nothing to do.")
+            return
+
+    print(f"Dates to process: {dates_to_run}")
+
+    # fetch all needed data in one yfinance call (max 7 days for 1m interval)
+    # split into chunks of 7 days
+    date_series = pd.to_datetime(dates_to_run)
+    start = (date_series.min() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    end   = (date_series.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    print(f"Fetching yfinance data from {start} to {end}...")
+    raw = fetch_yf_data(start, end)
+
+    if raw.empty:
+        print("No data fetched from yfinance.")
+        return
+
+    raw["datetime"] = pd.to_datetime(raw["datetime"])
+    if raw["datetime"].dt.tz is None:
+        raw["datetime"] = raw["datetime"].dt.tz_localize("UTC")
+    raw["datetime"] = raw["datetime"].dt.tz_convert(IST)
+    raw["date_str"] = raw["datetime"].dt.strftime("%Y-%m-%d")
 
     for date in dates_to_run:
-        print(f"Generating {date}...")
-        df = build_day(date, last_close)
-        last_close = float(df["close"].iloc[-1])  # chain days
-
-        out_path = _parquet_path(date)
-        df.to_parquet(out_path, index=False, engine="pyarrow")
-        print(f"  {'Updated' if os.path.exists(out_path) else 'Saved'} {len(df)} rows -> {out_path}")
-        print(f"  Close range: {df['close'].min():.2f} – {df['close'].max():.2f}")
-        print(f"  Signals: {df['signal'].value_counts().to_dict()}")
+        print(f"Processing {date}...")
+        day_df = raw[raw["date_str"] == date].drop(columns=["date_str"]).copy()
+        day_df["datetime"] = day_df["datetime"].dt.strftime("%Y-%m-%d %H:%M")
+        if day_df.empty:
+            print(f"  No yfinance data for {date}, skipping.")
+            continue
+        build_parquet(date, day_df)
 
 
 if __name__ == "__main__":

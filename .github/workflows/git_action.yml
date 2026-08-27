@@ -57,8 +57,13 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Generate today's parquet
-        run: python generate_parquet.py --today
+      - name: Generate parquet
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            python generate_parquet.py --today
+          else
+            python generate_parquet.py
+          fi
 
       - name: Commit and push parquet
         run: |
