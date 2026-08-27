@@ -3,16 +3,15 @@ name: Run Technical Indicators Script
 on:
   workflow_dispatch:
   schedule:
-    - cron: '* 3-10 * * 1-5'     # every 1 min, 8:30-15:30 IST (market hours)
-    - cron: '5 10 * * 1-5'       # 15:35 IST — after market close, generate parquet
+    - cron: '* 3-10 * * 1-5'    # every 1 min, 08:30-16:00 UTC (09:15-15:30 IST)
+    - cron: '5 10 * * 1-5'      # 15:35 IST — after market close, backfill parquet
 
 permissions:
   contents: write
 
 jobs:
-  run-script:
+  update:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/5 3-10 * * 1-5'
 
     steps:
       - uses: actions/checkout@v4
@@ -23,13 +22,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Fetch data, save parquet & update README
         run: python main.py
 
-      - name: Commit and push changes
+      - name: Backfill missing parquet files
+        run: python generate_parquet.py
+
+      - name: Commit and push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -39,40 +40,4 @@ jobs:
             git push origin main
           else
             echo "No changes to commit"
-          fi
-
-  generate-parquet:
-    runs-on: ubuntu-latest
-    if: github.event.schedule == '5 10 * * 1-5' || github.event_name == 'workflow_dispatch'
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-
-      - name: Generate parquet
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            python generate_parquet.py --today
-          else
-            python generate_parquet.py
-          fi
-
-      - name: Commit and push parquet
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
-          if ! git diff --cached --quiet; then
-            git commit -m "Parquet update $(date -u '+%Y-%m-%d') IST close"
-            git push origin main
-          else
-            echo "No parquet changes"
           fi

@@ -304,11 +304,14 @@ def fetch_yf(label: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def fetch_candles(tv: TvDatafeed, tv_symbol: str, exchange: str, label: str) -> pd.DataFrame:
+def fetch_candles(tv, tv_symbol: str, exchange: str, label: str) -> pd.DataFrame:
     df = fetch_yf(label)
     if df.empty:
-        logger.info("[%s] yfinance empty, falling back to TradingView", label)
-        df = fetch_tv(tv, tv_symbol, exchange, label)
+        if tv is not None:
+            logger.info("[%s] yfinance empty, falling back to TradingView", label)
+            df = fetch_tv(tv, tv_symbol, exchange, label)
+        else:
+            logger.warning("[%s] yfinance empty and TvDatafeed unavailable", label)
     if df.empty:
         logger.warning("[%s] No data from any source", label)
     return df
@@ -454,6 +457,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["price_change_pct"] = _safe(lambda: c.pct_change() * 100)
 
     return df
+
+
+# ==========================================================
+# SIGNAL
+# ==========================================================
 def generate_signal(row) -> str:
     try:
         required = ["close", "ema_20", "rsi_14", "macd", "macd_signal", "adx"]
@@ -582,7 +590,11 @@ def update_readme():
 # ==========================================================
 def main():
     logger.info("Starting fetch cycle")
-    tv = TvDatafeed()
+    try:
+        tv = TvDatafeed()
+    except Exception:
+        logger.warning("TvDatafeed init failed, will use yfinance only")
+        tv = None
 
     for symbol in INDEXES:
         try:
