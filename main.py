@@ -589,6 +589,9 @@ def update_readme():
 # MAIN
 # ==========================================================
 def main():
+    if not is_market_open():
+        logger.info("Market closed, skipping fetch.")
+        return
     logger.info("Starting fetch cycle")
     try:
         tv = TvDatafeed()
