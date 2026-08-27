@@ -3,8 +3,9 @@ name: Run Technical Indicators Script
 on:
   workflow_dispatch:
   schedule:
-    - cron: '* 3-10 * * 1-5'    # every 1 min, 08:30-16:00 UTC (09:15-15:30 IST)
-    - cron: '5 10 * * 1-5'      # 15:35 IST — after market close, backfill parquet
+    - cron: '45-59 3 * * 1-5'   # 09:15-09:29 IST (03:45-03:59 UTC)
+    - cron: '* 4-9 * * 1-5'     # 09:30-15:29 IST (04:00-09:59 UTC)
+    - cron: '0 10 * * 1-5'      # 15:30 IST (10:00 UTC)
 
 permissions:
   contents: write
@@ -26,9 +27,6 @@ jobs:
 
       - name: Fetch data, save parquet & update README
         run: python main.py
-
-      - name: Backfill missing parquet files
-        run: python generate_parquet.py
 
       - name: Commit and push
         run: |
