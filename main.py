@@ -454,11 +454,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["price_change_pct"] = _safe(lambda: c.pct_change() * 100)
 
     return df
-
-
-# ==========================================================
-# SIGNAL
-# ==========================================================
 def generate_signal(row) -> str:
     try:
         required = ["close", "ema_20", "rsi_14", "macd", "macd_signal", "adx"]

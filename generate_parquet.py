@@ -174,31 +174,51 @@ def main():
 
     print(f"Dates to process: {dates_to_run}")
 
-    # fetch all needed data in one yfinance call (max 7 days for 1m interval)
-    # split into chunks of 7 days
-    date_series = pd.to_datetime(dates_to_run)
-    start = (date_series.min() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    end   = (date_series.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    # yfinance 1-min data is only available for the last 7 days.
+    # Split dates into 7-calendar-day chunks and fetch each separately.
+    def _chunks(lst, days=6):
+        """Yield (start, end) pairs covering at most `days` calendar days."""
+        if not lst:
+            return
+        chunk_start = pd.Timestamp(lst[0])
+        chunk = []
+        for d in lst:
+            ts = pd.Timestamp(d)
+            if (ts - chunk_start).days > days:
+                yield chunk
+                chunk_start = ts
+                chunk = []
+            chunk.append(d)
+        if chunk:
+            yield chunk
 
-    print(f"Fetching yfinance data from {start} to {end}...")
-    raw = fetch_yf_data(start, end)
+    all_raw_frames = []
+    for chunk in _chunks(dates_to_run):
+        start = (pd.Timestamp(chunk[0])  - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        end   = (pd.Timestamp(chunk[-1]) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"Fetching yfinance {start} -> {end} ...")
+        raw = fetch_yf_data(start, end)
+        if not raw.empty:
+            all_raw_frames.append(raw)
 
-    if raw.empty:
+    if not all_raw_frames:
         print("No data fetched from yfinance.")
         return
 
+    raw = pd.concat(all_raw_frames, ignore_index=True)
     raw["datetime"] = pd.to_datetime(raw["datetime"])
     if raw["datetime"].dt.tz is None:
         raw["datetime"] = raw["datetime"].dt.tz_localize("UTC")
     raw["datetime"] = raw["datetime"].dt.tz_convert(IST)
     raw["date_str"] = raw["datetime"].dt.strftime("%Y-%m-%d")
+    raw = raw.drop_duplicates(subset=["datetime"]).reset_index(drop=True)
 
     for date in dates_to_run:
         print(f"Processing {date}...")
         day_df = raw[raw["date_str"] == date].drop(columns=["date_str"]).copy()
         day_df["datetime"] = day_df["datetime"].dt.strftime("%Y-%m-%d %H:%M")
         if day_df.empty:
-            print(f"  No yfinance data for {date}, skipping.")
+            print(f"  No yfinance data for {date} (beyond 7-day limit), skipping.")
             continue
         build_parquet(date, day_df)
 
