@@ -5,6 +5,7 @@ on:
   schedule:
     # Every 1 min, 03:00-10:59 UTC == 08:30-16:29 IST, Mon-Fri.
     # Covers market hours 09:15-15:30 IST; main.py filters candles to that window.
+    - cron: '* 3-10 * * 1-5'
 
 permissions:
   contents: write
